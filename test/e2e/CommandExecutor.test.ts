@@ -1,6 +1,6 @@
-import CommandExecutor from '../src/CommandExecutor.js';
-import TtyOutputReader from '../src/TtyOutputReader.js';
-import SendControlCharacter from '../src/SendControlCharacter.js';
+import CommandExecutor from '../../src/CommandExecutor.js';
+import TtyOutputReader from '../../src/TtyOutputReader.js';
+import SendControlCharacter from '../../src/SendControlCharacter.js';
 
 async function testExecuteCommand() {
   const executor = new CommandExecutor();
@@ -49,4 +49,42 @@ async function testSendControlCharacter() {
   }
 }
 
-testSendControlCharacter()
+async function testMultilineCommand() {
+  const executor = new CommandExecutor();
+  
+  // Create a multiline command
+  const multilineText = `for i in {1..5}; do
+  echo "Line $i"
+  sleep 1
+done`;
+  
+  try {
+    console.log("Testing multiline command handling...");
+    console.log("Sending multiline text:");
+    console.log("---");
+    console.log(multilineText);
+    console.log("---");
+    
+    const beforeCommandBuffer = await TtyOutputReader.retrieveBuffer();
+    const beforeCommandBufferLines = beforeCommandBuffer.split("\n").length;
+
+    await executor.executeCommand(multilineText);
+
+    const afterCommandBuffer = await TtyOutputReader.retrieveBuffer();
+    const afterCommandBufferLines = afterCommandBuffer.split("\n").length;
+    const outputLines = afterCommandBufferLines - beforeCommandBufferLines;
+    
+    console.log(`Result: ${outputLines} new lines were output`);
+    
+    const buffer = await TtyOutputReader.call(20);
+    console.log("Last 20 lines of output:");
+    console.log(buffer);
+    
+  } catch (error) {
+    console.error('Error executing multiline command:', (error as Error).message);
+  }
+}
+
+testMultilineCommand()
+await testExecuteCommand()
+await testSendControlCharacter()
