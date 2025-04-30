@@ -30,8 +30,8 @@ yarn test:watch
 # Run tests with coverage report
 yarn test:coverage
 
-# Run legacy test (original test file)
-yarn test:legacy
+# Run e2e tests
+yarn test:e2e
 ```
 
 ## Writing Tests
