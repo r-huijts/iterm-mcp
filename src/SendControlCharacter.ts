@@ -4,6 +4,11 @@ import { promisify } from 'node:util';
 const execPromise = promisify(exec);
 
 class SendControlCharacter {
+  // This method is added for testing purposes
+  protected async executeCommand(command: string): Promise<void> {
+    await execPromise(command);
+  }
+
   async send(letter: string): Promise<void> {
     let controlCode: number;
     
@@ -41,7 +46,7 @@ class SendControlCharacter {
     `;
 
     try {
-      await execPromise(`osascript -e '${ascript}'`);
+      await this.executeCommand(`osascript -e '${ascript}'`);
     } catch (error: unknown) {
       throw new Error(`Failed to send control character: ${(error as Error).message}`);
     }

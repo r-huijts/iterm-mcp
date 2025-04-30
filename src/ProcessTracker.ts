@@ -97,7 +97,6 @@ class ProcessTracker {
       };
 
     } catch (error) {
-      console.error('Error getting active process:', error);
       return null;
     }
   }
