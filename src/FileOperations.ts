@@ -1,8 +1,9 @@
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import fs from 'fs/promises';
+import path from 'path';
 import { createReadStream, createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
-import { diffLines, createTwoFilesPatch } from 'diff';
+import { diffLines, createTwoFilesPatch, parsePatch, reversePatch, applyPatch } from 'diff';
+import { PatchProcessor, PatchResult } from './PatchProcessor.js';
 
 export interface FileChange {
   id: string;
@@ -10,58 +11,101 @@ export interface FileChange {
   originalContent: string;
   newContent: string;
   diff: string;
+  reversePatch?: string; // NEW: Store the reverse patch for undo
+  timestamp: Date;
+  description?: string;
+}
+
+export interface AppliedChange {
+  id: string;
+  path: string;
+  reversePatch: string;
   timestamp: Date;
   description?: string;
 }
 
 export default class FileOperations {
   private pendingChanges: Map<string, FileChange> = new Map();
-  private pendingDir: string = '.pending';
-  private backupDir: string = '.backups';
+  private appliedChanges: Map<string, AppliedChange> = new Map(); // NEW: Track applied changes
+  private pendingDir: string;
+  private appliedDir: string; // NEW: Directory for applied changes
+  private allowedDirectories: string[] = [];
 
   constructor() {
-    // Ensure directories exist
+    // Initialize allowed directories from environment
+    this.initializeAllowedDirectories();
+    // Set pendingDir to be in the first allowed directory to avoid path issues
+    this.pendingDir = path.join(this.allowedDirectories[0], '.pending');
+    this.appliedDir = path.join(this.allowedDirectories[0], '.applied'); // NEW
+    // Ensure directories exist (only pending now!)
     this.ensureDirectories();
   }
 
-  private async ensureDirectories(): Promise<void> {
-    await fs.mkdir(this.pendingDir, { recursive: true }).catch(() => {});
-    await fs.mkdir(this.backupDir, { recursive: true }).catch(() => {});
+  /**
+   * Initialize allowed directories from environment variable
+   */
+  private initializeAllowedDirectories(): void {
+    const envDirs = process.env.ALLOWED_DIRECTORIES;
+    if (envDirs) {
+      try {
+        // Try to parse as JSON array first
+        this.allowedDirectories = JSON.parse(envDirs);
+      } catch {
+        // Fallback to comma-separated string
+        this.allowedDirectories = envDirs.split(',').map(dir => dir.trim());
+      }
+    } else {
+      // Default to current working directory if no allowed directories specified
+      this.allowedDirectories = [process.cwd()];
+    }
+
+    // Resolve all paths to absolute paths
+    this.allowedDirectories = this.allowedDirectories.map(dir => path.resolve(dir));
+    
+    console.error(`[FileOperations] Initialized with allowed directories: ${this.allowedDirectories.join(', ')}`);
   }
 
   /**
-   * Read a file's content
+   * Ensure required directories exist
    */
-  async readFile(filePath: string): Promise<string> {
+  private async ensureDirectories(): Promise<void> {
     try {
-      const content = await fs.readFile(filePath, 'utf-8');
-      return content;
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
-        throw new Error(`File not found: ${filePath}`);
-      }
-      throw new Error(`Error reading file: ${error.message}`);
+      await fs.mkdir(this.pendingDir, { recursive: true });
+      await fs.mkdir(this.appliedDir, { recursive: true }); // NEW
+      console.error(`[FileOperations] Ensured directories exist: ${this.pendingDir}, ${this.appliedDir}`);
+    } catch (error) {
+      console.error(`[FileOperations] Error creating directories: ${error}`);
     }
+  }
+
+  /**
+   * Validate that a file path is within allowed directories
+   */
+  private validatePath(filePath: string): boolean {
+    const resolvedPath = path.resolve(filePath);
+    return this.allowedDirectories.some(allowedDir => 
+      resolvedPath.startsWith(allowedDir + path.sep) || resolvedPath === allowedDir
+    );
   }
 
   /**
    * Write content to a file
    */
-  async writeFile(filePath: string, content: string, mode: 'w' | 'a' = 'w'): Promise<string> {
-    try {
-      // Ensure parent directory exists
-      const dir = path.dirname(filePath);
-      await fs.mkdir(dir, { recursive: true });
+  async writeFile(filePath: string, content: string, mode: 'w' | 'a' = 'w'): Promise<void> {
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
 
-      if (mode === 'a') {
-        await fs.appendFile(filePath, content, 'utf-8');
-        return `Content appended to ${filePath}`;
-      } else {
-        await fs.writeFile(filePath, content, 'utf-8');
-        return `File written: ${filePath}`;
-      }
-    } catch (error: any) {
-      throw new Error(`Error writing file: ${error.message}`);
+    const resolvedPath = path.resolve(filePath);
+    const dir = path.dirname(resolvedPath);
+    
+    // Ensure directory exists
+    await fs.mkdir(dir, { recursive: true });
+    
+    if (mode === 'a') {
+      await fs.appendFile(resolvedPath, content, 'utf8');
+    } else {
+      await fs.writeFile(resolvedPath, content, 'utf8');
     }
   }
 
@@ -69,113 +113,111 @@ export default class FileOperations {
    * Write file with diff preview
    */
   async writeFileWithDiff(filePath: string, content: string, showDiff: boolean = true): Promise<string> {
-    let originalContent = '';
-    let fileExists = false;
-
-    try {
-      originalContent = await this.readFile(filePath);
-      fileExists = true;
-    } catch {
-      // File doesn't exist yet
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
     }
 
-    if (fileExists) {
-      // Create backup first
-      await this.createBackup(filePath);
-    }
-
-    // Write the new content
-    await this.writeFile(filePath, content);
-
-    if (showDiff && fileExists) {
-      const diff = this.generateDiff(originalContent, content, filePath);
-      return `File updated successfully. Backup created.\n\n${diff}`;
-    }
-
-    return `File ${fileExists ? 'updated' : 'created'} successfully.`;
-  }
-
-  /**
-   * Create a directory
-   */
-  async createDirectory(dirPath: string): Promise<string> {
-    await fs.mkdir(dirPath, { recursive: true });
-    return `Directory created: ${dirPath}`;
-  }
-
-  /**
-   * List directory contents
-   */
-  async listDirectory(dirPath: string = '.', recursive: boolean = false): Promise<string> {
-    const results: string[] = [];
+    const resolvedPath = path.resolve(filePath);
+    let result = "File updated successfully.";
     
-    async function walk(dir: string, prefix: string = ''): Promise<void> {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-        const displayPath = prefix ? path.join(prefix, entry.name) : entry.name;
+    if (showDiff) {
+      try {
+        // Read existing content
+        const existingContent = await fs.readFile(resolvedPath, 'utf8');
         
-        if (entry.isDirectory()) {
-          results.push(`[DIR]  ${displayPath}/`);
-          if (recursive) {
-            await walk(fullPath, displayPath);
-          }
-        } else {
-          results.push(`[FILE] ${displayPath}`);
-        }
+        // Generate diff
+        const diff = createTwoFilesPatch(
+          filePath,
+          filePath,
+          existingContent,
+          content
+        );
+        
+        result += "\n\n" + diff;
+      } catch (error) {
+        // File doesn't exist, it's a new file
+        result = "New file created.";
       }
     }
-
-    await walk(dirPath);
-    return `Contents of ${dirPath}:\n${results.sort().join('\n')}`;
+    
+    // Write the file
+    await this.writeFile(filePath, content);
+    
+    return result;
   }
 
   /**
-   * Stage changes for review
+   * Stage changes for human review
    */
-  async stageChanges(filePath: string, content: string, description?: string): Promise<string> {
-    const changeId = Math.random().toString(36).substring(2, 10);
-    
-    let originalContent = '';
-    try {
-      originalContent = await this.readFile(filePath);
-    } catch {
-      // File doesn't exist yet
+  async stageChanges(filePath: string, content: string, description: string): Promise<string> {
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
     }
 
-    const diff = this.generateDiff(originalContent, content, filePath);
+    const resolvedPath = path.resolve(filePath);
+    let originalContent = '';
+    
+    // Read existing content if file exists
+    try {
+      originalContent = await fs.readFile(resolvedPath, 'utf8');
+    } catch (error) {
+      // File doesn't exist, treat as empty
+      originalContent = '';
+    }
 
+    // Generate change ID
+    const changeId = Math.random().toString(36).substring(2, 10);
+    
+    // Create forward diff
+    const diff = createTwoFilesPatch(
+      filePath,
+      filePath,
+      originalContent,
+      content
+    );
+
+    // NEW: Create reverse patch for undo functionality
+    let reversePatch = '';
+    try {
+      // Create reverse patch by swapping old and new content
+      reversePatch = createTwoFilesPatch(
+        filePath,
+        filePath,
+        content,
+        originalContent
+      );
+    } catch (error) {
+      console.error(`[FileOperations] Error creating reverse patch: ${error}`);
+    }
+
+    // Create change object
     const change: FileChange = {
       id: changeId,
-      path: filePath,
+      path: resolvedPath,
       originalContent,
       newContent: content,
       diff,
+      reversePatch, // NEW
       timestamp: new Date(),
       description
     };
 
-    // Save to pending directory
-    const changeDir = path.join(this.pendingDir, changeId);
-    await fs.mkdir(changeDir, { recursive: true });
-
-    await fs.writeFile(path.join(changeDir, 'original.txt'), originalContent);
-    await fs.writeFile(path.join(changeDir, 'modified.txt'), content);
-    await fs.writeFile(path.join(changeDir, 'changes.diff'), diff);
-    await fs.writeFile(
-      path.join(changeDir, 'metadata.json'),
-      JSON.stringify({
-        id: changeId,
-        path: filePath,
-        timestamp: change.timestamp,
-        description
-      }, null, 2)
-    );
-
+    // Store in memory
     this.pendingChanges.set(changeId, change);
 
-    return `Changes staged with ID: ${changeId}\nPath: ${filePath}${description ? `\nDescription: ${description}` : ''}`;
+    // Also store to disk for persistence
+    try {
+      await fs.writeFile(
+        path.join(this.pendingDir, `${changeId}.json`),
+        JSON.stringify(change, null, 2),
+        'utf8'
+      );
+    } catch (error) {
+      console.error(`[FileOperations] Error saving staged change to disk: ${error}`);
+      // Continue anyway since we have it in memory
+    }
+
+    return changeId;
   }
 
   /**
@@ -183,15 +225,37 @@ export default class FileOperations {
    */
   async listPendingChanges(): Promise<string> {
     if (this.pendingChanges.size === 0) {
-      return 'No pending changes.';
+      return "No pending changes.";
     }
 
-    const changes = Array.from(this.pendingChanges.values());
-    const list = changes.map(change => 
-      `- ${change.id}\n  File: ${change.path}\n  Time: ${change.timestamp.toLocaleString()}${change.description ? `\n  Description: ${change.description}` : ''}`
-    ).join('\n\n');
+    let result = "Pending changes:\n";
+    for (const [id, change] of this.pendingChanges) {
+      const timeStr = change.timestamp.toLocaleString();
+      result += `${id}: ${change.path} (${timeStr}) - ${change.description || 'No description'}\n`;
+    }
+    
+    return result.trim();
+  }
 
-    return `Pending changes:\n\n${list}`;
+  /**
+   * List all applied changes that can be undone
+   */
+  async listAppliedChanges(): Promise<string> {
+    if (this.appliedChanges.size === 0) {
+      return "No applied changes available for undo.";
+    }
+
+    let result = "Applied changes (available for undo):\n";
+    // Sort by timestamp, most recent first
+    const sortedChanges = Array.from(this.appliedChanges.entries())
+      .sort(([,a], [,b]) => b.timestamp.getTime() - a.timestamp.getTime());
+    
+    for (const [id, change] of sortedChanges) {
+      const timeStr = change.timestamp.toLocaleString();
+      result += `${id}: ${change.path} (${timeStr}) - ${change.description || 'No description'}\n`;
+    }
+    
+    return result.trim();
   }
 
   /**
@@ -203,11 +267,11 @@ export default class FileOperations {
       throw new Error(`Change ${changeId} not found`);
     }
 
-    return `Change preview for ${change.path}:\n\n${change.diff}`;
+    return `Change ${changeId}: ${change.path}\n${change.description || 'No description'}\n\nDiff:\n${change.diff}`;
   }
 
   /**
-   * Apply a staged change
+   * Apply a staged change and store reverse patch for undo
    */
   async applyChange(changeId: string): Promise<string> {
     const change = this.pendingChanges.get(changeId);
@@ -215,22 +279,72 @@ export default class FileOperations {
       throw new Error(`Change ${changeId} not found`);
     }
 
-    // Create backup if file exists
-    try {
-      await this.createBackup(change.path);
-    } catch {
-      // File doesn't exist yet
-    }
-
-    // Apply the change
+    // Write the new content
     await this.writeFile(change.path, change.newContent);
 
-    // Clean up
-    const changeDir = path.join(this.pendingDir, changeId);
-    await fs.rm(changeDir, { recursive: true, force: true });
-    this.pendingChanges.delete(changeId);
+    // NEW: Store applied change with reverse patch for undo
+    if (change.reversePatch) {
+      const appliedChange: AppliedChange = {
+        id: changeId,
+        path: change.path,
+        reversePatch: change.reversePatch,
+        timestamp: new Date(),
+        description: change.description
+      };
 
-    return `Change applied successfully to ${change.path}`;
+      this.appliedChanges.set(changeId, appliedChange);
+
+      // Save applied change to disk
+      try {
+        await fs.writeFile(
+          path.join(this.appliedDir, `${changeId}.json`),
+          JSON.stringify(appliedChange, null, 2),
+          'utf8'
+        );
+      } catch (error) {
+        console.error(`[FileOperations] Error saving applied change to disk: ${error}`);
+      }
+    }
+
+    // Remove from pending
+    this.pendingChanges.delete(changeId);
+    await fs.unlink(path.join(this.pendingDir, `${changeId}.json`)).catch(() => {});
+
+    return `Change ${changeId} applied successfully to ${change.path}`;
+  }
+
+  /**
+   * NEW: Undo an applied change using stored reverse patch
+   */
+  async undoChange(changeId: string): Promise<string> {
+    const appliedChange = this.appliedChanges.get(changeId);
+    if (!appliedChange) {
+      throw new Error(`Applied change ${changeId} not found or cannot be undone`);
+    }
+
+    try {
+      // Read current file content
+      const currentContent = await fs.readFile(appliedChange.path, 'utf8');
+      
+      // Apply the reverse patch
+      const undoResult = applyPatch(currentContent, appliedChange.reversePatch);
+      
+      if (undoResult === false) {
+        throw new Error(`Failed to apply reverse patch - file may have been modified since the change was applied`);
+      }
+
+      // Write the undone content
+      await fs.writeFile(appliedChange.path, undoResult, 'utf8');
+
+      // Remove from applied changes
+      this.appliedChanges.delete(changeId);
+      await fs.unlink(path.join(this.appliedDir, `${changeId}.json`)).catch(() => {});
+
+      return `Change ${changeId} successfully undone. File ${appliedChange.path} reverted to previous state.`;
+
+    } catch (error) {
+      throw new Error(`Failed to undo change ${changeId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /**
@@ -242,52 +356,165 @@ export default class FileOperations {
       throw new Error(`Change ${changeId} not found`);
     }
 
-    // Clean up
-    const changeDir = path.join(this.pendingDir, changeId);
-    await fs.rm(changeDir, { recursive: true, force: true });
+    // Remove from pending
     this.pendingChanges.delete(changeId);
+    await fs.unlink(path.join(this.pendingDir, `${changeId}.json`)).catch(() => {});
 
-    return 'Change rejected and removed.';
+    return `Change ${changeId} rejected and removed.`;
   }
 
   /**
-   * Create a backup of a file
+   * Apply a patch to a file using the PatchProcessor (no backup!)
    */
-  async createBackup(filePath: string): Promise<string> {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-    const fileName = path.basename(filePath);
-    const backupPath = path.join(this.backupDir, `${fileName}_${timestamp}.bak`);
-
-    await fs.copyFile(filePath, backupPath);
-    return `Backup created: ${backupPath}`;
-  }
-
-  /**
-   * Apply a patch to a file
-   */
-  async applyPatch(filePath: string, patch: string, dryRun: boolean = true): Promise<string> {
-    if (dryRun) {
-      return `Dry run - patch preview:\n\n${patch}\n\nUse dry_run: false to apply.`;
+  async applyPatch(filePath: string, patchContent: string, dryRun: boolean = false): Promise<PatchResult> {
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
     }
 
-    // In a real implementation, you'd use a proper patch library
-    // For now, this is a placeholder
-    await this.createBackup(filePath);
-    return `Patch applied to ${filePath} (backup created)`;
+    return await PatchProcessor.applyPatch(filePath, patchContent, dryRun);
   }
 
   /**
-   * Generate a unified diff
+   * Validate a patch without applying it
    */
-  private generateDiff(original: string, modified: string, filename: string): string {
-    return createTwoFilesPatch(
-      `${filename} (original)`,
-      `${filename} (modified)`,
-      original,
-      modified,
-      undefined,
-      undefined,
-      { context: 3 }
+  async validatePatch(patchContent: string): Promise<{ isValid: boolean; affectedFiles: string[]; errors: string[]; warnings: string[] }> {
+    try {
+      const result = PatchProcessor.validatePatch(patchContent);
+      return result;
+    } catch (error) {
+      return {
+        isValid: false,
+        affectedFiles: [],
+        errors: [(error as Error).message],
+        warnings: []
+      };
+    }
+  }
+
+  /**
+   * Generate a patch between two files
+   */
+  async generatePatchBetweenFiles(oldFile: string, newFile: string): Promise<string> {
+    if (!this.validatePath(oldFile) || !this.validatePath(newFile)) {
+      throw new Error(`Access denied: Paths must be within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    try {
+      const oldContent = await this.readFile(oldFile);
+      const newContent = await this.readFile(newFile);
+      
+      // Simple diff implementation
+      const diff = require('diff');
+      const patch = diff.createPatch(
+        path.basename(oldFile),
+        oldContent,
+        newContent,
+        'old',
+        'new'
+      );
+      
+      return patch;
+    } catch (error) {
+      throw new Error(`Failed to generate patch: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Copy a file
+   */
+  async copyFile(sourcePath: string, destinationPath: string): Promise<void> {
+    if (!this.validatePath(sourcePath) || !this.validatePath(destinationPath)) {
+      throw new Error(`Access denied: Paths must be within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    const resolvedSource = path.resolve(sourcePath);
+    const resolvedDest = path.resolve(destinationPath);
+    const destDir = path.dirname(resolvedDest);
+    
+    // Ensure destination directory exists
+    await fs.mkdir(destDir, { recursive: true });
+    
+    // Use streams for efficient copying
+    await pipeline(
+      createReadStream(resolvedSource),
+      createWriteStream(resolvedDest)
     );
+  }
+
+  /**
+   * Delete a file
+   */
+  async deleteFile(filePath: string): Promise<void> {
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    const resolvedPath = path.resolve(filePath);
+    await fs.unlink(resolvedPath);
+  }
+
+  /**
+   * Read a file
+   */
+  async readFile(filePath: string): Promise<string> {
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    const resolvedPath = path.resolve(filePath);
+    return await fs.readFile(resolvedPath, 'utf8');
+  }
+
+  /**
+   * Check if a file exists
+   */
+  async fileExists(filePath: string): Promise<boolean> {
+    if (!this.validatePath(filePath)) {
+      return false;
+    }
+
+    try {
+      const resolvedPath = path.resolve(filePath);
+      await fs.access(resolvedPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get file stats
+   */
+  async getFileStats(filePath: string) {
+    if (!this.validatePath(filePath)) {
+      throw new Error(`Access denied: Path '${filePath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    const resolvedPath = path.resolve(filePath);
+    return await fs.stat(resolvedPath);
+  }
+
+  /**
+   * List directory contents
+   */
+  async listDirectory(dirPath: string): Promise<string[]> {
+    if (!this.validatePath(dirPath)) {
+      throw new Error(`Access denied: Path '${dirPath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    const resolvedPath = path.resolve(dirPath);
+    return await fs.readdir(resolvedPath);
+  }
+
+  /**
+   * Create a directory
+   */
+  async createDirectory(dirPath: string): Promise<void> {
+    if (!this.validatePath(dirPath)) {
+      throw new Error(`Access denied: Path '${dirPath}' is not within allowed directories: ${this.allowedDirectories.join(', ')}`);
+    }
+
+    const resolvedPath = path.resolve(dirPath);
+    await fs.mkdir(resolvedPath, { recursive: true });
   }
 }

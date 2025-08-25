@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "iterm-mcp": {
+      "command": "node",
+      "args": [
+        "/Users/happyhawking/Documents/Projects/Current/Claude/servers/iterm-mcp/build/index.js"
+      ]
+    }
+  }
+} 

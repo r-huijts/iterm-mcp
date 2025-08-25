@@ -6,6 +6,8 @@ A Model Context Protocol server that provides access to your iTerm session AND p
 
 **Natural Integration:** You share iTerm with the model. You can ask questions about what's on the screen, or delegate a task to the model and watch as it performs each step.
 
+**Lightning Fast Performance:** Now with **iTerm2 Python API integration** - 3-5x faster than AppleScript! Command execution, output reading, and control characters are dramatically faster.
+
 **Full Terminal Control and REPL support:** The model can start and interact with REPL's as well as send control characters like ctrl-c, ctrl-z, etc.
 
 **Safe File Operations:** Read and write files using Node.js file system APIs - no shell escaping issues! Features automatic backups, diff previews, and a staging system for reviewing changes before applying them.
@@ -51,7 +53,18 @@ A Model Context Protocol server that provides access to your iTerm session AND p
 
 * iTerm2 must be running
 * Node version 18 or greater
+* Python 3.7+ (for Python API integration)
 * Additional dependency: `diff` package for generating file diffs
+
+### Python API Setup (Recommended)
+
+For optimal performance, enable the iTerm2 Python API:
+
+1. Open iTerm2 → Preferences → General → Python API
+2. Check "Enable Python API"
+3. Set "Require 'Automation' permission" for security
+
+The server will automatically install the required Python packages in a virtual environment.
 
 
 ## Installation

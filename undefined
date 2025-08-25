@@ -1,0 +1,160 @@
+import SwiftUI
+import AVKit
+
+struct VideoPlayerView: View {
+    let video: YouTubeVideo
+    @State private var player: AVPlayer?
+    @State private var isLoading = true
+    @State private var errorMessage = ""
+    @State private var streamURL: String?
+    @State private var loadingProgress = "Initializing..."
+    @State private var isFullScreen = false
+    @Environment(\.dismiss) private var dismiss
+    
+    private let streamService = StreamService.shared
+    
+    var body: some View {
+        if isFullScreen {
+            // Full Screen Mode
+            fullScreenPlayerView
+        } else {
+            // Normal Mode
+            NavigationView {
+                VStack(spacing: 0) {
+                    if isLoading {
+                        loadingView
+                    } else if !errorMessage.isEmpty {
+                        errorView
+                    } else if let player = player {
+                        normalPlayerView(player: player)
+                    } else {
+                        // This should not happen, but just in case
+                        VStack {
+                            Text("Something went wrong")
+                            Button("Try Again") {
+                                loadStream()
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("Video Player")
+                .navigationBarTitleDisplayMode(.inline)
+                .navigationBarBackButtonHidden(true)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Done") {
+                            cleanupPlayer()
+                            dismiss()
+                        }
+                    }
+                    
+                    if let player = player {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button(action: {
+                                enterFullScreen()
+                            }) {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                    .font(.title3)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @ViewBuilder
+    private var fullScreenPlayerView: some View {
+        ZStack {
+            Color.black.ignoresSafeArea(.all)
+            
+            if let player = player {
+                VideoPlayer(player: player)
+                    .onAppear {
+                        print("📱 Full-screen player appeared")
+                    }
+                
+                // Full-screen controls overlay
+                VStack {
+                    HStack {
+                        Button("Exit Full Screen") {
+                            exitFullScreen()
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.7))
+                        .cornerRadius(8)
+                        
+                        Spacer()
+                    }
+                    .padding(.top, 50)
+                    .padding(.horizontal, 20)
+                    
+                    Spacer()
+                    
+                    // Bottom info overlay
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(video.title)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .shadow(radius: 2)
+                            .lineLimit(2)
+                        
+                        Text(video.uploader)
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.8))
+                            .shadow(radius: 1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 50)
+                    .background(
+                        LinearGradient(
+                            gradient: Gradient(colors: [.clear, .black.opacity(0.6)]),
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: 120)
+                    )
+                }
+            }
+        }
+        .statusBarHidden()
+        .persistentSystemOverlays(.hidden)
+    }
+    
+    private var loadingView: some View {
+        VStack(spacing: 20) {
+            ProgressView()
+                .scaleEffect(1.5)
+            
+            Text("Loading Video")
+                .font(.headline)
+            
+            Text(loadingProgress)
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            
+            // Show video info while loading
+            VStack(spacing: 8) {
+                Text(video.title)
+                    .font(.subheadline)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                
+                Text("by \(video.uploader)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding()
+            
+            if let streamURL = streamURL {
+                Text("Stream URL obtained ✅")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                    .padding(.top)
+            }
+        }
+        

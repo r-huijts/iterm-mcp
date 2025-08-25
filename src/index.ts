@@ -1,17 +1,24 @@
 #!/usr/bin/env node
-
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import CommandExecutor from "./CommandExecutor.js";
+import PythonCommandExecutor from "./PythonCommandExecutor.js";
 import TtyOutputReader from "./TtyOutputReader.js";
+import PythonTtyOutputReader from "./PythonTtyOutputReader.js";
 import SendControlCharacter from "./SendControlCharacter.js";
+import PythonSendControlCharacter from "./PythonSendControlCharacter.js";
 import FileOperations from "./FileOperations.js";
 
 const fileOps = new FileOperations();
+
+// Configuration: Set to true to use the faster Python API, false for AppleScript
+const USE_PYTHON_API = true;
 
 const server = new Server(
   {
@@ -50,7 +57,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             linesOfOutput: {
-              type: "integer",
+              type: "number",
               description: "Number of lines to read from the bottom of the terminal. Default is 25. Increase for long outputs (e.g., 100 for test results, 200 for build logs)"
             },
           },
@@ -71,21 +78,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["letter"]
         }
       },
+
       // File operation tools
-      {
-        name: "read_file",
-        description: "Read the complete contents of any text file using Node.js file system (not terminal commands). This is the primary way to inspect code files, configuration files, or any text content. Much more reliable than using 'cat' in the terminal. Returns the entire file content as a string. Use this before making any modifications to understand the current state.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            path: {
-              type: "string",
-              description: "Absolute or relative file path. Examples: 'src/index.js', '/Users/name/project/config.json', './README.md'"
-            }
-          },
-          required: ["path"]
-        }
-      },
       {
         name: "write_file",
         description: "Write or append content to a file using Node.js file system. Creates the file if it doesn't exist, including any necessary parent directories. Use mode 'w' to completely replace file contents, or 'a' to add to the end. This is the most direct way to create or modify files - much more reliable than echo/cat in terminal. Perfect for saving generated code, updating configurations, or creating new files.",
@@ -102,9 +96,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             mode: {
               type: "string",
-              description: "Write mode: 'w' completely overwrites the file (default), 'a' appends to the end of existing content",
               enum: ["w", "a"],
-              default: "w"
+              description: "Write mode: 'w' completely overwrites the file (default), 'a' appends to the end of existing content"
             }
           },
           required: ["path", "content"]
@@ -112,13 +105,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "write_file_with_diff",
-        description: "Write file with automatic backup and optional diff preview. This is the SAFEST way to modify existing files. It: 1) Creates a timestamped backup in .backups/ folder, 2) Shows a unified diff of changes (if file exists), 3) Writes the new content. Perfect for refactoring code or making careful edits where you want to see exactly what changed. The diff uses standard unified format showing removed lines with '-' and added lines with '+'.",
+        description: "Write file with diff preview showing exactly what changed. This is perfect for code modifications where you want to see the changes clearly. Shows a unified diff with removed lines marked with '-' and added lines with '+'. No backups are created - trust Git for version control.",
         inputSchema: {
           type: "object",
           properties: {
             path: {
               type: "string",
-              description: "File path to write. If file exists, a backup will be created before overwriting"
+              description: "File path to write. If file exists, a diff will be shown"
             },
             content: {
               type: "string",
@@ -126,49 +119,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             show_diff: {
               type: "boolean",
-              description: "Whether to include a unified diff in the response showing what changed. Default true. Set false for new files or when diff isn't needed",
-              default: true
+              description: "Whether to include a unified diff in the response showing what changed. Default true. Set false for new files or when diff isn't needed"
             }
           },
           required: ["path", "content"]
         }
       },
-      {
-        name: "create_directory",
-        description: "Create a directory and all necessary parent directories. Safe to call even if directory already exists. Use this before writing files to ensure the directory structure exists, or when setting up project structures. Works like 'mkdir -p' but using Node.js file system.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            path: {
-              type: "string",
-              description: "Directory path to create. Examples: 'src/components/forms', './test/fixtures'. Parent directories are created automatically"
-            }
-          },
-          required: ["path"]
-        }
-      },
-      {
-        name: "list_directory",
-        description: "List contents of a directory with clear [FILE] and [DIR] labels. Use this to explore project structure, find files, or verify directory contents. Can list recursively to see entire directory trees. More reliable than 'ls' command as it provides consistent formatted output. Essential for understanding project organization before making changes.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            path: {
-              type: "string",
-              description: "Directory path to list. Use '.' for current directory. Examples: 'src/', '../', '/Users/name/project'",
-              default: "."
-            },
-            recursive: {
-              type: "boolean",
-              description: "List all subdirectories recursively. Useful for seeing entire project structure. Warning: can produce very long output for large directories",
-              default: false
-            }
-          }
-        }
-      },
+     
+
+      // Staging system tools
       {
         name: "stage_changes",
-        description: "Stage file changes for human review before applying them. This creates a 'pending change' that can be reviewed, previewed with diff, and then either applied or rejected. Use this when making important changes that need human approval. Each staged change gets a unique ID and is saved in .pending/ directory. This is the SAFEST approach for critical file modifications. The process: 1) Stage the change, 2) Human reviews with preview_change, 3) Human decides to apply_change or reject_change.",
+        description: "Stage file changes for human review before applying them. This creates a 'pending change' that can be reviewed, previewed with diff, and then either applied or rejected. Use this when making important changes that need human approval. Each staged change gets a unique ID and is saved in .pending/ directory. This is the SAFEST approach for critical file modifications. The process: 1) Stage the change, 2) Human reviews with preview_change, 3) Human decides to apply_change or reject_change. IMPORTANT: Always follow up by using preview_change and displaying the diff in a formatted ```diff code block so the human can see exactly what will change and approve/reject the changes.",
         inputSchema: {
           type: "object",
           properties: {
@@ -198,7 +160,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "preview_change",
-        description: "Preview a specific staged change with full unified diff. Shows exactly what will change if the change is applied - removed lines prefixed with '-', added lines with '+', and context lines for clarity. Use this with a change ID from list_pending_changes to help humans understand the impact before approving. Essential for reviewing staged modifications.",
+        description: "Preview a specific staged change with full unified diff. Shows exactly what will change if the change is applied - removed lines prefixed with '-', added lines with '+', and context lines for clarity. Use this with a change ID from list_pending_changes to help humans understand the impact before approving. Essential for reviewing staged modifications. CRITICAL: Always format the diff output in a ```diff code block immediately after calling this tool so the human can clearly see and review the proposed changes before deciding to apply or reject them.",
         inputSchema: {
           type: "object",
           properties: {
@@ -212,7 +174,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "apply_change",
-        description: "Apply a staged change after human approval. This: 1) Creates a backup of the current file (if it exists), 2) Writes the new content, 3) Removes the change from pending queue. Use this after preview_change when the human approves. The change ID comes from list_pending_changes. Once applied, the change cannot be reversed except by restoring from backup.",
+        description: "Apply a staged change after human approval. This writes the new content and removes the change from pending queue. Use this after preview_change when the human approves. The change ID comes from list_pending_changes. Once applied, the change is permanent (trust Git for version control).",
         inputSchema: {
           type: "object",
           properties: {
@@ -238,74 +200,114 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["change_id"]
         }
       },
-      {
-        name: "create_backup",
-        description: "Create a timestamped backup of any file. Copies the file to .backups/ directory with format: filename_YYYY-MM-DD_HHMMSS.bak. Use this before risky operations or when you want to preserve the current state. Backups are never automatically deleted. Returns the backup file path for reference.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            path: {
-              type: "string",
-              description: "File path to backup. File must exist or error will be thrown"
-            }
-          },
-          required: ["path"]
-        }
-      },
+
+      // Patch system tools
       {
         name: "apply_patch",
-        description: "Apply a unified diff patch to a file. Supports standard unified diff format (like from 'git diff' or 'diff -u'). Use dry_run=true first to preview what would happen. Automatically creates a backup before applying. Useful for applying changes from external sources or reverting modifications. Note: Current implementation is a placeholder - full patch application coming soon.",
+        description: "Apply a unified diff patch to a file with comprehensive validation and error handling. Supports standard unified diff format (like from 'git diff' or 'diff -u'). Features: 1) Validates patch syntax before applying, 2) Shows detailed analysis of what will change, 3) Provides detailed success/error reporting with hunk counts. Use dry_run=true first to preview changes safely. Perfect for applying patches from external sources, reverting modifications, or collaborative development workflows.",
         inputSchema: {
           type: "object",
           properties: {
             path: {
               type: "string",
-              description: "Target file to apply the patch to"
+              description: "Target file to apply the patch to. File must exist unless patch creates a new file."
             },
             patch: {
               type: "string",
-              description: "Unified diff format patch content. Should include --- and +++ headers and @@ hunk markers"
+              description: "Unified diff format patch content. Should include --- and +++ headers and @@ hunk markers. Example format:\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n line1\n-old line\n+new line\n line3"
             },
             dry_run: {
               type: "boolean",
-              description: "If true, only preview what would be done without actually applying. Always use true first to verify the patch will apply correctly",
-              default: true
+              description: "If true, analyzes and validates the patch without applying it. Shows what would change and whether the patch can be applied cleanly. ALWAYS use true first to verify the patch before applying."
             }
           },
           required: ["path", "patch"]
         }
+      },
+      {
+        name: "validate_patch",
+        description: "Validate a unified diff patch without applying it to any file. This is useful for checking patch syntax, understanding what files are affected, and identifying potential issues before attempting to apply the patch. Returns detailed analysis including affected files, validation status, and any warnings or errors.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            patch: {
+              type: "string",
+              description: "Unified diff format patch content to validate. Should include --- and +++ headers and @@ hunk markers."
+            }
+          },
+          required: ["patch"]
+        }
+      },
+      {
+        name: "generate_patch",
+        description: "Generate a unified diff patch by comparing two files. Useful for creating patches that can be shared, version controlled, or applied later. The generated patch follows standard unified diff format and can be used with apply_patch.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            old_file: {
+              type: "string",
+              description: "Path to the original/old version of the file"
+            },
+            new_file: {
+              type: "string",
+              description: "Path to the modified/new version of the file"
+            }
+          },
+          required: ["old_file", "new_file"]
+        }
       }
-    ]
+    ],
   };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (request.params.name) {
-      // Original iTerm handlers
       case "write_to_terminal": {
-        let executor = new CommandExecutor();
         const command = String(request.params.arguments?.command);
-        const beforeCommandBuffer = await TtyOutputReader.retrieveBuffer();
-        const beforeCommandBufferLines = beforeCommandBuffer.split("\n").length;
         
-        await executor.executeCommand(command);
-        
-        const afterCommandBuffer = await TtyOutputReader.retrieveBuffer();
-        const afterCommandBufferLines = afterCommandBuffer.split("\n").length;
-        const outputLines = afterCommandBufferLines - beforeCommandBufferLines
-
-        return {
-          content: [{
-            type: "text",
-            text: `${outputLines} lines were output after sending the command to the terminal. Read the last ${outputLines} lines of terminal contents to orient yourself. Never assume that the command was executed or that it was successful.`
-          }]
-        };
+        if (USE_PYTHON_API) {
+          let executor = new PythonCommandExecutor();
+          const beforeCommandBuffer = await PythonTtyOutputReader.retrieveBuffer();
+          const beforeCommandBufferLines = beforeCommandBuffer.split("\n").length;
+          
+          await executor.executeCommand(command);
+          
+          const afterCommandBuffer = await PythonTtyOutputReader.retrieveBuffer();
+          const afterCommandBufferLines = afterCommandBuffer.split("\n").length;
+          const outputLines = afterCommandBufferLines - beforeCommandBufferLines;
+          
+          return {
+            content: [{
+              type: "text",
+              text: `${outputLines} lines were output after sending the command to the terminal. Read the last ${outputLines} lines of terminal contents to orient yourself. Never assume that the command was executed or that it was successful.`
+            }]
+          };
+        } else {
+          let executor = new CommandExecutor();
+          const beforeCommandBuffer = await TtyOutputReader.retrieveBuffer();
+          const beforeCommandBufferLines = beforeCommandBuffer.split("\n").length;
+          
+          await executor.executeCommand(command);
+          
+          const afterCommandBuffer = await TtyOutputReader.retrieveBuffer();
+          const afterCommandBufferLines = afterCommandBuffer.split("\n").length;
+          const outputLines = afterCommandBufferLines - beforeCommandBufferLines;
+          
+          return {
+            content: [{
+              type: "text",
+              text: `${outputLines} lines were output after sending the command to the terminal. Read the last ${outputLines} lines of terminal contents to orient yourself. Never assume that the command was executed or that it was successful.`
+            }]
+          };
+        }
       }
+
       case "read_terminal_output": {
         const linesOfOutput = Number(request.params.arguments?.linesOfOutput) || 25
-        const output = await TtyOutputReader.call(linesOfOutput)
-
+        const output = USE_PYTHON_API 
+          ? await PythonTtyOutputReader.call(linesOfOutput)
+          : await TtyOutputReader.call(linesOfOutput);
         return {
           content: [{
             type: "text",
@@ -313,34 +315,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       case "send_control_character": {
-        const ttyControl = new SendControlCharacter();
         const letter = String(request.params.arguments?.letter);
-        await ttyControl.send(letter);
-        
+        if (USE_PYTHON_API) {
+          const ttyControl = new PythonSendControlCharacter();
+          await ttyControl.send(letter);
+        } else {
+          const ttyControl = new SendControlCharacter();
+          await ttyControl.send(letter);
+        }
         return {
           content: [{
             type: "text",
-            text: `Sent control character: Control-${letter.toUpperCase()}`
+            text: `Control character sent: Ctrl+${letter.toUpperCase()}`
           }]
         };
       }
-      
+
       // File operation handlers
-      case "read_file": {
-        const path = String(request.params.arguments?.path);
-        const content = await fileOps.readFile(path);
-        return {
-          content: [{
-            type: "text",
-            text: content
-          }]
-        };
-      }
       case "write_file": {
-        const path = String(request.params.arguments?.path);
-        const content = String(request.params.arguments?.content);
+        // Validate required parameters
+        if (!request.params.arguments?.path) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Missing required parameter 'path' for write_file tool"
+          );
+        }
+        
+        if (!request.params.arguments?.content) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Missing required parameter 'content' for write_file tool"
+          );
+        }
+        
+        const path = String(request.params.arguments.path);
+        const content = String(request.params.arguments.content);
         const mode = request.params.arguments?.mode as 'w' | 'a' || 'w';
+        
         const result = await fileOps.writeFile(path, content, mode);
         return {
           content: [{
@@ -349,9 +362,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       case "write_file_with_diff": {
-        const path = String(request.params.arguments?.path);
-        const content = String(request.params.arguments?.content);
+        // Validate required parameters
+        if (!request.params.arguments?.path) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Missing required parameter 'path' for write_file_with_diff tool"
+          );
+        }
+        
+        if (!request.params.arguments?.content) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Missing required parameter 'content' for write_file_with_diff tool"
+          );
+        }
+        
+        const path = String(request.params.arguments.path);
+        const content = String(request.params.arguments.content);
         const showDiff = request.params.arguments?.show_diff !== false;
         const result = await fileOps.writeFileWithDiff(path, content, showDiff);
         return {
@@ -361,32 +390,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
-      case "create_directory": {
-        const path = String(request.params.arguments?.path);
-        const result = await fileOps.createDirectory(path);
-        return {
-          content: [{
-            type: "text",
-            text: result
-          }]
-        };
-      }
-      case "list_directory": {
-        const path = String(request.params.arguments?.path || '.');
-        const recursive = Boolean(request.params.arguments?.recursive);
-        const result = await fileOps.listDirectory(path, recursive);
-        return {
-          content: [{
-            type: "text",
-            text: result
-          }]
-        };
-      }
+
+      // Staging system handlers
       case "stage_changes": {
-        const path = String(request.params.arguments?.path);
-        const content = String(request.params.arguments?.content);
+        // Validate required parameters
+        if (!request.params.arguments?.path) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Missing required parameter 'path' for stage_changes tool"
+          );
+        }
+        
+        if (!request.params.arguments?.content) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Missing required parameter 'content' for stage_changes tool"
+          );
+        }
+        
+        const path = String(request.params.arguments.path);
+        const content = String(request.params.arguments.content);
         const description = request.params.arguments?.description as string | undefined;
-        const result = await fileOps.stageChanges(path, content, description);
+        const result = await fileOps.stageChanges(path, content, description || 'No description');
         return {
           content: [{
             type: "text",
@@ -394,6 +419,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       case "list_pending_changes": {
         const result = await fileOps.listPendingChanges();
         return {
@@ -403,6 +429,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       case "preview_change": {
         const changeId = String(request.params.arguments?.change_id);
         const result = await fileOps.previewChange(changeId);
@@ -413,6 +440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       case "apply_change": {
         const changeId = String(request.params.arguments?.change_id);
         const result = await fileOps.applyChange(changeId);
@@ -423,6 +451,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       case "reject_change": {
         const changeId = String(request.params.arguments?.change_id);
         const result = await fileOps.rejectChange(changeId);
@@ -433,21 +462,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
-      case "create_backup": {
-        const path = String(request.params.arguments?.path);
-        const result = await fileOps.createBackup(path);
-        return {
-          content: [{
-            type: "text",
-            text: result
-          }]
-        };
-      }
+
+      // Patch system handlers
       case "apply_patch": {
         const path = String(request.params.arguments?.path);
         const patch = String(request.params.arguments?.patch);
         const dryRun = request.params.arguments?.dry_run !== false;
         const result = await fileOps.applyPatch(path, patch, dryRun);
+        
+        if (dryRun) {
+          return {
+            content: [{
+              type: "text",
+              text: `Dry run analysis:\nSuccess: ${result.success}\nHunks: ${result.hunksApplied}/${result.hunksTotal}\nErrors: ${result.errors.join(', ')}\n\nPreview of changes:\n${result.content?.substring(0, 500)}${result.content && result.content.length > 500 ? '...' : ''}`
+            }]
+          };
+        } else {
+          return {
+            content: [{
+              type: "text",
+              text: `Patch applied: ${result.success ? 'SUCCESS' : 'FAILED'}\nHunks applied: ${result.hunksApplied}/${result.hunksTotal}${result.errors.length > 0 ? '\nErrors: ' + result.errors.join(', ') : ''}`
+            }]
+          };
+        }
+      }
+
+      case "validate_patch": {
+        const patch = String(request.params.arguments?.patch);
+        const result = await fileOps.validatePatch(patch);
+        return {
+          content: [{
+            type: "text",
+            text: `Patch validation:\nValid: ${result.isValid}\nAffected files: ${result.affectedFiles.join(', ')}\nErrors: ${result.errors.join(', ')}\nWarnings: ${result.warnings.join(', ')}`
+          }]
+        };
+      }
+
+      case "generate_patch": {
+        const oldFile = String(request.params.arguments?.old_file);
+        const newFile = String(request.params.arguments?.new_file);
+        const result = await fileOps.generatePatchBetweenFiles(oldFile, newFile);
         return {
           content: [{
             type: "text",
@@ -455,26 +509,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }]
         };
       }
+
       default:
-        throw new Error("Unknown tool");
+        throw new McpError(
+          ErrorCode.MethodNotFound,
+          `Unknown tool: ${request.params.name}`
+        );
     }
-  } catch (error: any) {
-    return {
-      content: [{
-        type: "text",
-        text: `Error: ${error.message}`
-      }],
-      isError: true
-    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new McpError(ErrorCode.InternalError, errorMessage);
   }
 });
 
-async function main() {
+async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  console.error("iTerm MCP Server running on stdio");
 }
 
-main().catch((error) => {
-  console.error("Server error:", error);
+runServer().catch((error) => {
+  console.error("Fatal error running server:", error);
   process.exit(1);
 });
